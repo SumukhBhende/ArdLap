@@ -1,25 +1,45 @@
-# How to Run Everything
+### 3. The Python Backend Server (`app.py`)
 
-## 1. Connect Arduino
-Plug your Arduino UNO into your laptop's USB port.
+This Python script sets up the web server and handles communication with the Arduino.
 
-## 2. Find Serial Port
-Open the Arduino IDE, go to **Tools → Port**, and note which port your Arduino is on (e.g., `COM3`, `/dev/ttyACM0`).
+#### Prerequisites
 
-## 3. Update Python Script
-Open `app.py` and set the `ARDUINO_PORT` variable to the port name you found in the previous step.
+Install the required Python libraries by running:
 
-## 4. Run the Server
-Open a terminal or command prompt, navigate to the folder containing your files, and run:
+```bash
+pip install Flask pyserial Flask-Cors
+```
+
+---
+
+## How to Run Everything
+
+### 1. Connect the Arduino
+
+Plug your Arduino UNO into your computer's USB port.
+
+### 2. Identify the Serial Port
+
+In the Arduino IDE, go to **Tools → Port** and note the port name (e.g., `COM3` on Windows or `/dev/ttyACM0` on Linux).
+
+### 3. Configure the Python Script
+
+Edit `app.py` and set the `ARDUINO_PORT` variable to the port you found above.
+
+### 4. Start the Server
+
+Open a terminal, navigate to your project folder, and run:
 
 ```bash
 python app.py
 ```
 
-You should see a message indicating it's connected to the Arduino and running at [http://127.0.0.1:5000](http://127.0.0.1:5000).
+You should see a message confirming connection to the Arduino and that the server is running at [http://127.0.0.1:5000](http://127.0.0.1:5000).
 
-## 5. Open the UI
-Double-click the `index.html` file to open it in your web browser.
+### 5. Launch the UI
 
-## 6. Control Your Machine
-Click the **Up**, **Down**, **Left**, and **Right** buttons. Your motors should move, and you'll see log messages in the terminal where the server is running.
+Open `index.html` in your web browser.
+
+### 6. Control the Machine
+
+Use the **Up**, **Down**, **Left**, and **Right** buttons in the UI. The motors should respond, and log messages will appear in the terminal running the server.
