@@ -7,7 +7,7 @@ This Python script sets up the web server and handles communication with the Ard
 Install the required Python libraries by running:
 
 ```bash
-pip install Flask pyserial Flask-Cors
+pip install Flask opencv-contrib-python pyserial Flask-Cors
 ```
 
 ---
