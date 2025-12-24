@@ -6,31 +6,33 @@ import collections
 # ===================== CONFIGURATION =====================
 
 # --- HARDWARE ---
-CAMERA_INDEX = 0         
-SERIAL_PORT = "COM3"     # <--- CHECK YOUR PORT
+CAMERA_INDEX = 0        
+SERIAL_PORT = "COM3"     # <--- CHECK THIS
 BAUDRATE = 115200
 
-# --- SAFETY LIMITS (CRITICAL) ---
-# The machine can only move 3.0 units from center.
-# We set it to 2.9 to be safe.
-MAX_TRAVEL_LIMIT = 2.9   
+# --- SAFETY LIMITS ---
+MAX_TRAVEL_LIMIT = 2.9   # Machine stays within +/- 2.9 units
+MAX_SINGLE_STEP = 0.3    # Max combined step size (Safety Speed Limit)
 
 # --- TUNING ---
-DEAD_ZONE_X = 20         # Pixels
-KP_X = 0.1               # Gain for X
+# 1. Lateral (Left/Right)
+DEAD_ZONE_X = 20         
+KP_X = 0.08              # Gain for Side-to-Side
+INVERT_X = True          # You confirmed this is needed
 
-DEAD_ZONE_DEPTH = 15     # Pixels (Width difference)
-KP_DEPTH = 0.2           # Gain for Y
+# 2. Depth (Front/Back)
+DEAD_ZONE_DEPTH = 15     
+KP_DEPTH = 0.15          # Depth usually needs higher gain to be responsive
+INVERT_Y = False         # Standard: Object Big = Move Back
 
-MAX_STEP_MM = 0.5        # Limit single step size (smoothness)
-SMOOTHING_BUFFER = 5     
+# 3. Smoothing
+SMOOTHING_BUFFER = 8     # Average last 8 frames
 
 # =========================================================
 
 # --- STATE VARIABLES ---
-# We track where the machine IS, so we don't hit the wall.
-current_machine_x = 0.0
-current_machine_y = 0.0
+cur_machine_x = 0.0
+cur_machine_y = 0.0
 
 # --- SERIAL SETUP ---
 try:
@@ -40,14 +42,9 @@ try:
     time.sleep(1)
     ser.flushInput()
     print("✅ GRBL Connected")
-    
-    # 1. SET ZERO: Tell machine "Here is 0,0"
-    ser.write(b"G92 X0 Y0\n")
-    time.sleep(0.1)
-    
-    # 2. MODES: mm (G21) and Relative (G91)
+    ser.write(b"G92 X0 Y0\n") 
     ser.write(b"G21 G91\n") 
-    ser.write(b"G1 F1500\n") # Speed
+    ser.write(b"G1 F1500\n") 
 
 except Exception as e:
     print(f"❌ Serial Error: {e}")
@@ -57,66 +54,48 @@ except Exception as e:
 history_x = collections.deque(maxlen=SMOOTHING_BUFFER)
 history_width = collections.deque(maxlen=SMOOTHING_BUFFER)
 
-def move_machine_safely(axis, move_val):
+def send_simultaneous_move(move_right_val, move_front_val):
     """
-    Checks limits BEFORE sending G-code.
-    axis: 'X' or 'Y'
-    move_val: requested distance in units (e.g., +0.5 or -0.2)
+    Combines Left/Right and Front/Back into a single smooth CoreXY motion.
     """
-    global current_machine_x, current_machine_y, ser
-
+    global cur_machine_x, cur_machine_y, ser
     if ser is None: return
 
-    # 1. Clamp the step size (Don't jump too fast)
-    move_val = max(min(move_val, MAX_STEP_MM), -MAX_STEP_MM)
+    # 1. Calculate the Motor Moves based on your Kinematics
+    # Your Data:
+    # Right (+): X+ Y+
+    # Front (+): X+ Y-
     
-    # 2. Check Soft Limits (The Wall)
-    if axis == 'X':
-        predicted_pos = current_machine_x + move_val
-        if abs(predicted_pos) > MAX_TRAVEL_LIMIT:
-            print(f"⚠️ LIMIT HIT X: {predicted_pos:.2f} (Ignored)")
-            return # CANCEL MOVE
+    # Formula:
+    # Gcode_X = Right + Front
+    # Gcode_Y = Right - Front
+    
+    motor_x = move_right_val + move_front_val
+    motor_y = move_right_val - move_front_val
+    
+    # 2. Safety Clamping (Prevent violent jumps)
+    # We clamp the vector magnitude approximately by clamping components
+    motor_x = max(min(motor_x, MAX_SINGLE_STEP), -MAX_SINGLE_STEP)
+    motor_y = max(min(motor_y, MAX_SINGLE_STEP), -MAX_SINGLE_STEP)
+
+    # 3. Soft Limit Check (Predictive)
+    pred_x = cur_machine_x + motor_x
+    pred_y = cur_machine_y + motor_y
+    
+    if abs(pred_x) > MAX_TRAVEL_LIMIT or abs(pred_y) > MAX_TRAVEL_LIMIT:
+        print("⚠️ WALL HIT PREVENTED")
+        return # Skip this move
         
-        # Valid move? Update tracking
-        current_machine_x += move_val
-        
-        # CoreXY Mixing for X (Right/Left)
-        # RIGHT (+): X+ Y+
-        # LEFT (-):  X- Y-
-        cmd = f"X{move_val:.3f} Y{move_val:.3f}"
-
-    elif axis == 'Y':
-        predicted_pos = current_machine_y + move_val
-        if abs(predicted_pos) > MAX_TRAVEL_LIMIT:
-            print(f"⚠️ LIMIT HIT Y: {predicted_pos:.2f} (Ignored)")
-            return # CANCEL MOVE
-
-        current_machine_y += move_val
-
-        # CoreXY Mixing for Y (Front/Back)
-        # Assuming Positive Move = Forward (Front) = negy (X+ Y-)
-        # Assuming Negative Move = Backward (Back) = posy (X- Y+)
-        
-        # Note: Based on your test "X-3 Y3 moves +Y (Back/Up)"
-        # And "X3 Y-3 moves -Y (Front/Down)"
-        
-        if move_val > 0:
-            # Moving "Forward" (closer to camera?) -> usually -Y in machine terms if 0,0 is center
-            # Let's trust your test: To move -Y (Front), use X+ Y-
-            # Wait, we need to define what "Positive move_val" means.
-            # In tracking logic: Positive Error = Object Too Small = Move Closer.
-            # If "Closer" means Front, and Front is X3 Y-3:
-             cmd = f"X{move_val:.3f} Y-{move_val:.3f}"
-        else:
-            # Moving "Back" (Away). Your test: +Y is X-3 Y3
-            # We need to invert the value because 'move_val' is negative here
-            abs_val = abs(move_val)
-            cmd = f"X-{abs_val:.3f} Y{abs_val:.3f}"
-
-    # 3. Send Command
-    full_cmd = f"G1 {cmd}\n"
-    ser.write(full_cmd.encode())
-
+    # 4. Update Position & Send
+    cur_machine_x += motor_x
+    cur_machine_y += motor_y
+    
+    # Only move if the values are non-zero (avoids spamming serial)
+    if abs(motor_x) > 0.001 or abs(motor_y) > 0.001:
+        cmd = f"G1 X{motor_x:.3f} Y{motor_y:.3f}\n"
+        ser.write(cmd.encode())
+        return True
+    return False
 
 def main():
     cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -129,11 +108,10 @@ def main():
     if not ret: return
 
     print("\n--- INSTRUCTIONS ---")
-    print(f"1. Machine Soft Limits set to +/- {MAX_TRAVEL_LIMIT} units.")
-    print("2. Select object to LOCK TARGET.")
+    print("Select Object. Initial Width = Target Distance.")
     
-    roi = cv2.selectROI("Select Object", frame, showCrosshair=True, fromCenter=False)
-    cv2.destroyWindow("Select Object")
+    roi = cv2.selectROI("Tracker", frame, showCrosshair=True, fromCenter=False)
+    cv2.destroyWindow("Tracker")
     if roi[2] == 0: return
 
     try:
@@ -144,8 +122,8 @@ def main():
 
     TARGET_WIDTH = roi[2]
     TARGET_CENTER_X = frame.shape[1] // 2
-
-    print(f"✅ Target Width: {TARGET_WIDTH}. Area bounded to +/- {MAX_TRAVEL_LIMIT}.")
+    
+    print(f"✅ LOCKED. Target Width: {TARGET_WIDTH}")
 
     try:
         while True:
@@ -153,59 +131,73 @@ def main():
             if not ret: break
 
             ok, bbox = tracker.update(frame)
-            status_text = "Idle"
+            status = "Idle"
 
             if ok:
                 (x, y, w, h) = [int(v) for v in bbox]
                 cx = x + w // 2
                 
-                # Smoothing
+                # Update Smoothing
                 history_x.append(cx)
                 history_width.append(w)
                 avg_x = sum(history_x) / len(history_x)
                 avg_w = sum(history_width) / len(history_width)
 
-                # Errors
-                err_x = avg_x - TARGET_CENTER_X
-                # If Target=100, Curr=80 (Far away) -> Error = +20 -> Move Closer
-                err_depth = TARGET_WIDTH - avg_w 
+                # --- 1. CALCULATE RAW ERRORS ---
+                # X Error: Target - Current 
+                # (Standard Control: Setpoint - ProcessVariable)
+                raw_err_x = TARGET_CENTER_X - avg_x  
+                
+                # Depth Error: Target - Current
+                # Positive = Object too small (Far) -> Needs Approach
+                raw_err_depth = TARGET_WIDTH - avg_w
 
-                # CONTROL X
-                if abs(err_x) > DEAD_ZONE_X:
-                    # Convert pixels to machine units
-                    move_req = err_x * KP_X * 0.1 # Scaling factor (Pixels are big, mm is small)
-                    # Note: You might need to tune this 0.1 depending on if "3 units" is 3mm or 3cm
-                    move_machine_safely('X', move_req)
-                    status_text = f"X Err {err_x:.0f}"
+                # --- 2. CALCULATE DESIRED MOVES (CARTESIAN) ---
+                move_right_req = 0.0
+                move_front_req = 0.0
 
-                # CONTROL Y (Depth)
-                elif abs(err_depth) > DEAD_ZONE_DEPTH:
-                    move_req = err_depth * KP_DEPTH * 0.1
-                    move_machine_safely('Y', move_req)
-                    status_text = f"Z Err {err_depth:.0f}"
+                # X Logic
+                if abs(raw_err_x) > DEAD_ZONE_X:
+                    # If Camera is Right of Object, Object looks "Left" (x < Center).
+                    # err_x = Center - x (Positive).
+                    # If object is Left, we must move Left to center it.
+                    # So Positive Error -> Negative Move (Left).
+                    move_right_req = -1 * raw_err_x * KP_X * 0.1
+                    
+                    if INVERT_X: move_right_req *= -1
+
+                # Depth Logic
+                if abs(raw_err_depth) > DEAD_ZONE_DEPTH:
+                    # Positive Error (Far) -> Move Front (+)
+                    move_front_req = raw_err_depth * KP_DEPTH * 0.1
+                    
+                    if INVERT_Y: move_front_req *= -1
+
+                # --- 3. EXECUTE SIMULTANEOUS MOVE ---
+                did_move = send_simultaneous_move(move_right_req, move_front_req)
+                
+                if did_move:
+                    status = f"Tracking... X:{move_right_req:.2f} Y:{move_front_req:.2f}"
 
                 # Visuals
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 
-            # Info overlay
-            cv2.putText(frame, f"Pos: ({current_machine_x:.2f}, {current_machine_y:.2f})", 
+            # Info
+            cv2.putText(frame, f"Machine: {cur_machine_x:.2f}, {cur_machine_y:.2f}", 
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(frame, status_text, (10, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(frame, status, (10, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
-            cv2.imshow("Safe Tracker", frame)
+            cv2.imshow("Simultaneous Tracker", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     finally:
-        # RETURN TO HOME
-        print("\n🛑 STOPPING. Returning to Home (0,0)...")
+        print("\n🛑 Homing...")
         cap.release()
         cv2.destroyAllWindows()
         if ser:
-            ser.write(b"G90\n")     # Absolute Mode
-            ser.write(b"G0 X0 Y0\n") # Go Home
+            ser.write(b"G90 G0 X0 Y0\n")
             time.sleep(3)
             ser.close()
-            print("✅ Done.")
 
 if __name__ == "__main__":
     main()

@@ -1,184 +1,211 @@
 import cv2
 import serial
 import time
-import math
+import collections
 
-# ===================== CONFIG =====================
+# ===================== CONFIGURATION =====================
 
-# Camera
-CAMERA_INDEX = 0
-
-# Control
-DEAD_ZONE = 10
-PIXEL_TO_MM = 0.05
-MAX_STEP_MM = 0.5          # max step per cycle (smooth motion)
-CONTROL_DELAY = 0.05
-
-# CNC limits (ABSOLUTE, SAFE WORKSPACE)
-X_MIN, X_MAX = -3.0, 3.0
-Y_MIN, Y_MAX = -3.0, 3.0
-
-# GRBL
-SERIAL_PORT = "COM3"
+# --- HARDWARE ---
+CAMERA_INDEX = 1         
+SERIAL_PORT = "COM3"     
 BAUDRATE = 115200
-FEEDRATE = 800
 
-# Kinematic scaling (45-degree correction)
-KIN_SCALE = 1 / math.sqrt(2)
+# --- SAFETY LIMITS ---
+MAX_TRAVEL_LIMIT = 2.9   # Machine stays within +/- 2.9 units
 
-# =================================================
+# --- TUNING (ADJUSTED FOR STABILITY) ---
 
+# 1. Lateral (Left/Right)
+DEAD_ZONE_X = 30         # Increased: Ignore small shakes
+KP_X = 0.05              # Reduced: Move slower/smoother
+INVERT_X = True          # <--- CHANGED: Fixes your Left/Right issue
 
-# ---------- GRBL SERIAL ----------
-ser = serial.Serial(SERIAL_PORT, BAUDRATE)
-time.sleep(2)
-ser.write(b"\r\n\r\n")
-time.sleep(2)
-ser.flushInput()
+# 2. Depth (Forward/Backward)
+DEAD_ZONE_DEPTH = 20     # Increased: Needs to be very wrong before moving
+KP_DEPTH = 0.05          # Reduced: Prevents the "Runaway" overshoot
+INVERT_Y = False         # Keep False first. If it moves WRONG way, change to True.
 
-def send_gcode(cmd):
-    """Send and PRINT gcode"""
-    print(f"[GCODE] {cmd}")
-    ser.write((cmd + "\n").encode())
-    ser.flush()
+# 3. Safety
+MAX_STEP_MM = 0.2        # <--- REDUCED: Max step is tiny now to stop crashing
+SMOOTHING_BUFFER = 10    # <--- INCREASED: Average last 10 frames for stability
 
+# =========================================================
 
-# ---------- STATE ----------
-# Track absolute CNC position
-cur_x = 0.0
-cur_y = 0.0
+# --- STATE VARIABLES ---
+current_machine_x = 0.0
+current_machine_y = 0.0
 
+# --- SERIAL SETUP ---
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+    time.sleep(2)
+    ser.write(b"\r\n\r\n")
+    time.sleep(1)
+    ser.flushInput()
+    print("✅ GRBL Connected")
+    ser.write(b"G92 X0 Y0\n") # Set Home
+    ser.write(b"G21 G91\n")   # mm and Relative
+    ser.write(b"G1 F1000\n")  # Slower Feedrate for safety
 
-# ---------- HELPERS ----------
-def clamp(val, vmin, vmax):
-    return max(vmin, min(vmax, val))
+except Exception as e:
+    print(f"❌ Serial Error: {e}")
+    ser = None
 
+# --- SMOOTHING ---
+history_x = collections.deque(maxlen=SMOOTHING_BUFFER)
+history_width = collections.deque(maxlen=SMOOTHING_BUFFER)
 
-def move_camera(dx_mm, dy_mm):
-    """
-    Camera-space correction -> Absolute CNC motion (G90)
-    Applies diagonal kinematic compensation and workspace limits
-    """
-    global cur_x, cur_y
+def move_machine_safely(axis, move_val):
+    global current_machine_x, current_machine_y, ser
+    if ser is None: return
 
-    # Inverse kinematics (camera -> machine)
-    mx = (dx_mm - dy_mm) * KIN_SCALE
-    my = (dx_mm + dy_mm) * KIN_SCALE
+    # 1. Clamp Speed
+    move_val = max(min(move_val, MAX_STEP_MM), -MAX_STEP_MM)
+    
+    # 2. Check Soft Limits
+    if axis == 'X':
+        predicted_pos = current_machine_x + move_val
+        if abs(predicted_pos) > MAX_TRAVEL_LIMIT:
+            print(f"⚠️ WALL HIT X: {predicted_pos:.2f}")
+            return
+        
+        current_machine_x += move_val
+        
+        # INVERT_X HANDLER
+        # If Logic says "Move Right" (move_val > 0)
+        # We send the command that YOU verified goes Right (X+ Y+)
+        # If INVERT_X is True, we flip the sign of move_val before deciding
+        
+        effective_move = move_val
+        if INVERT_X: effective_move = -move_val
 
-    # Limit per-step motion
-    mx = clamp(mx, -MAX_STEP_MM, MAX_STEP_MM)
-    my = clamp(my, -MAX_STEP_MM, MAX_STEP_MM)
+        # CoreXY Logic:
+        # If effective > 0 (Right): X+ Y+
+        # If effective < 0 (Left):  X- Y-
+        cmd = f"X{effective_move:.3f} Y{effective_move:.3f}"
 
-    # Update absolute position
-    new_x = clamp(cur_x + mx, X_MIN, X_MAX)
-    new_y = clamp(cur_y + my, Y_MIN, Y_MAX)
+    elif axis == 'Y':
+        predicted_pos = current_machine_y + move_val
+        if abs(predicted_pos) > MAX_TRAVEL_LIMIT:
+            print(f"⚠️ WALL HIT Y: {predicted_pos:.2f}")
+            return
 
-    # If no movement possible
-    if abs(new_x - cur_x) < 1e-4 and abs(new_y - cur_y) < 1e-4:
-        return None
+        current_machine_y += move_val
+        
+        # INVERT_Y HANDLER
+        effective_move = move_val
+        if INVERT_Y: effective_move = -move_val
 
-    cur_x, cur_y = new_x, new_y
+        # Y Logic (Depth):
+        # effective > 0 (Move Forward/Down): X+ Y-
+        # effective < 0 (Move Back/Up):      X- Y+
+        
+        if effective_move > 0:
+            cmd = f"X{effective_move:.3f} Y-{effective_move:.3f}"
+        else:
+            d = abs(effective_move)
+            cmd = f"X-{d:.3f} Y{d:.3f}"
 
-    return f"G90 G1 X{cur_x:.3f} Y{cur_y:.3f} F{FEEDRATE}"
+    full_cmd = f"G1 {cmd}\n"
+    ser.write(full_cmd.encode())
 
-
-# ---------- MAIN ----------
 def main():
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print("❌ Camera not found")
-        return
+    if not cap.isOpened(): return
+
+    # Standard res
+    cap.set(3, 640)
+    cap.set(4, 480)
 
     ret, frame = cap.read()
-    if not ret:
-        print("❌ Frame read error")
-        return
+    if not ret: return
 
-    print("\nSelect object to track and press ENTER")
-    roi = cv2.selectROI("Select Object", frame, False, True)
+    print("\n--- READY ---")
+    roi = cv2.selectROI("Select Object", frame, showCrosshair=True, fromCenter=False)
     cv2.destroyWindow("Select Object")
+    if roi[2] == 0: return
 
-    if roi[2] == 0 or roi[3] == 0:
-        print("❌ No ROI selected")
-        return
-
-    # Tracker
-    if hasattr(cv2, "TrackerCSRT_create"):
+    try:
         tracker = cv2.TrackerCSRT_create()
-    else:
+    except:
         tracker = cv2.legacy.TrackerCSRT_create()
-
     tracker.init(frame, roi)
-    print("✅ Tracking started (press 'q' to quit)")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    TARGET_WIDTH = roi[2]
+    TARGET_CENTER_X = frame.shape[1] // 2
+    
+    print(f"✅ LOCKED. Target Width: {TARGET_WIDTH}")
 
-        frame_h, frame_w = frame.shape[:2]
-        frame_cx = frame_w // 2
-        frame_cy = frame_h // 2
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
 
-        ok, bbox = tracker.update(frame)
+            ok, bbox = tracker.update(frame)
+            status_text = "Idle"
 
-        if ok:
-            x, y, bw, bh = map(int, bbox)
+            if ok:
+                (x, y, w, h) = [int(v) for v in bbox]
+                cx = x + w // 2
+                
+                history_x.append(cx)
+                history_width.append(w)
+                avg_x = sum(history_x) / len(history_x)
+                avg_w = sum(history_width) / len(history_width)
 
-            obj_cx = x + bw // 2
-            obj_cy = y + bh // 2
+                # --- ERROR CALCULATION ---
+                # X Error: Target(320) - Current(200) = +120. Machine must move LEFT to catch up.
+                # (My previous code did Current - Target, so signs were flipped. 
+                # I fixed it here to be standard: Error = Setpoint - ProcessVar)
+                
+                # Logic: We want the CAMERA to follow the object.
+                # If Object is at 100 (Left), Camera is at 320.
+                # Camera needs to move LEFT.
+                # Error = 100 - 320 = -220. 
+                # Negative Error -> Move Negative (Left).
+                # My 'move_machine' function maps Neg -> Left.
+                # So: Error = Current - Center.
+                
+                err_x = avg_x - TARGET_CENTER_X
+                err_depth = TARGET_WIDTH - avg_w 
 
-            error_x = obj_cx - frame_cx
-            error_y = obj_cy - frame_cy
+                # CONTROL X
+                if abs(err_x) > DEAD_ZONE_X:
+                    # err_x is pixels (e.g. 50). KP is 0.05. Move = 2.5 units? Too big.
+                    # scaled by 0.1 again inside just to be sure.
+                    move_req = err_x * KP_X * 0.1 
+                    move_machine_safely('X', move_req)
+                    status_text = f"X Correction"
 
-            dx_mm = 0.0
-            dy_mm = 0.0
+                # CONTROL Y (Depth)
+                elif abs(err_depth) > DEAD_ZONE_DEPTH:
+                    # If err_depth is Positive (Target > Current), Object is Small (Far).
+                    # We need to move Forward (+).
+                    move_req = err_depth * KP_DEPTH * 0.1
+                    move_machine_safely('Y', move_req)
+                    
+                    if move_req > 0: status_text = "Approaching..."
+                    else: status_text = "Backing up..."
 
-            if abs(error_x) > DEAD_ZONE:
-                dx_mm = error_x * PIXEL_TO_MM
+                # Visuals
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+            cv2.putText(frame, f"Machine: ({current_machine_x:.2f}, {current_machine_y:.2f})", 
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, status_text, (10, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            cv2.imshow("Tracker", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
 
-            if abs(error_y) > DEAD_ZONE:
-                dy_mm = error_y * PIXEL_TO_MM
-
-            gcode = move_camera(dx_mm, dy_mm)
-            if gcode:
-                send_gcode(gcode)
-
-            # ---- VISUALIZATION ----
-            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            cv2.circle(frame, (obj_cx, obj_cy), 5, (0, 0, 255), -1)
-            cv2.line(
-                frame,
-                (frame_cx, frame_cy),
-                (obj_cx, obj_cy),
-                (0, 255, 255),
-                2
-            )
-
-        # Frame center
-        cv2.circle(frame, (frame_cx, frame_cy), 5, (255, 0, 0), -1)
-
-        # Dead zone
-        cv2.rectangle(
-            frame,
-            (frame_cx - DEAD_ZONE, frame_cy - DEAD_ZONE),
-            (frame_cx + DEAD_ZONE, frame_cy + DEAD_ZONE),
-            (255, 255, 0),
-            1
-        )
-
-        cv2.imshow("Vision-Based CNC Tracking", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-        time.sleep(CONTROL_DELAY)
-
-    cap.release()
-    cv2.destroyAllWindows()
-    ser.close()
-    print("✅ Shutdown complete")
-
+    finally:
+        print("\n🛑 Returning Home...")
+        cap.release()
+        cv2.destroyAllWindows()
+        if ser:
+            ser.write(b"G90\n")
+            ser.write(b"G0 X0 Y0\n")
+            time.sleep(3)
+            ser.close()
 
 if __name__ == "__main__":
     main()
