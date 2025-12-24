@@ -1,157 +1,219 @@
 import cv2
 import serial
 import time
+import collections
 
 # ===================== CONFIGURATION =====================
-CAMERA_INDEX = 0      # Try 1 if 0 doesn't work
-SERIAL_PORT = "COM3"  # Change to your port
+
+# --- HARDWARE ---
+CAMERA_INDEX = 1        
+SERIAL_PORT = "COM3"     # <--- CHECK THIS
 BAUDRATE = 115200
 
-# Tuning
-DEAD_ZONE = 20        # Pixels (Increased to stop jitter)
-PIXEL_TO_MM = 0.05    # Conversion ratio (tune this for distance)
-MOVE_DELAY = 0.05     # Delay between commands to let motors react
+# --- SAFETY LIMITS ---
+MAX_TRAVEL_LIMIT = 2.9   
+MAX_SINGLE_STEP = 0.2    # Kept low for safety
+
+# --- TUNING (PD CONTROLLER) ---
+# 1. Lateral (Left/Right) - X AXIS
+DEAD_ZONE_X = 30         
+KP_X = 0.04              # Gentle P-gain
+KD_X = 0.03              # Strong D-gain (Braking) to stop oscillation
+INVERT_X = True          
+
+# 2. Depth (Front/Back) - Y AXIS (HIGH SENSITIVITY)
+# We track (Width + Height) / 2.
+DEAD_ZONE_DEPTH = 5      # <--- VERY LOW: React to small size changes
+KP_DEPTH = 0.15          # <--- HIGH: Strong reaction to size change
+KD_DEPTH = 0.10          # <--- HIGH: Brake hard to prevent "Runaway"
+INVERT_Y = False         
+
+# 3. Smoothing
+SMOOTHING_BUFFER = 10    # Heavy smoothing to handle the low deadzone
 
 # =========================================================
 
-# 1. Setup Serial
+# --- STATE VARIABLES ---
+cur_machine_x = 0.0
+cur_machine_y = 0.0
+
+prev_error_x = 0.0
+prev_error_depth = 0.0
+
+# --- SERIAL SETUP ---
 try:
     ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
-    time.sleep(2) # Allow Arduino to reset
-    ser.write(b"\r\n\r\n") # Wake up GRBL
+    time.sleep(2)
+    ser.write(b"\r\n\r\n")
     time.sleep(1)
     ser.flushInput()
     print("✅ GRBL Connected")
-    
-    # Set to Relative Mode (G91) and Millimeters (G21)
+    ser.write(b"G92 X0 Y0\n") 
     ser.write(b"G21 G91\n") 
-    # Set speed (F value)
-    ser.write(b"G1 F2000\n") 
+    ser.write(b"G1 F1000\n") 
+
 except Exception as e:
     print(f"❌ Serial Error: {e}")
     ser = None
 
-# 2. Your Custom Kinematics Functions (G91 Relative)
-def move_machine(direction, distance_mm):
-    if ser is None: return
-    
-    cmd = ""
-    d = f"{distance_mm:.2f}"
-    
-    # YOUR specific logic for mixed axis movement
-    if direction == "RIGHT":  # posx
-        cmd = f"X{d} Y{d}"
-    elif direction == "LEFT": # negx
-        cmd = f"X-{d} Y-{d}"
-    elif direction == "UP":   # posy (Camera Up / Machine Back)
-        cmd = f"X-{d} Y{d}"
-    elif direction == "DOWN": # negy (Camera Down / Machine Front)
-        cmd = f"X{d} Y-{d}"
-        
-    if cmd:
-        # Send G1 (Linear Move) + the relative coordinates
-        full_cmd = f"G1 {cmd}\n"
-        # print(f"Sending: {full_cmd.strip()}") 
-        ser.write(full_cmd.encode())
+history_x = collections.deque(maxlen=SMOOTHING_BUFFER)
+history_size = collections.deque(maxlen=SMOOTHING_BUFFER)
 
-# ===================== MAIN LOOP =====================
+def send_simultaneous_move(move_right_val, move_front_val):
+    global cur_machine_x, cur_machine_y, ser
+    if ser is None: return
+
+    # CoreXY Mixing
+    motor_x = move_right_val + move_front_val
+    motor_y = move_right_val - move_front_val
+    
+    # Clamp Speed
+    motor_x = max(min(motor_x, MAX_SINGLE_STEP), -MAX_SINGLE_STEP)
+    motor_y = max(min(motor_y, MAX_SINGLE_STEP), -MAX_SINGLE_STEP)
+
+    # Soft Limit Check
+    pred_x = cur_machine_x + motor_x
+    pred_y = cur_machine_y + motor_y
+    
+    if abs(pred_x) > MAX_TRAVEL_LIMIT or abs(pred_y) > MAX_TRAVEL_LIMIT:
+        print("⚠️ WALL HIT PREVENTED")
+        return False
+        
+    cur_machine_x += motor_x
+    cur_machine_y += motor_y
+    
+    if abs(motor_x) > 0.001 or abs(motor_y) > 0.001:
+        cmd = f"G1 X{motor_x:.3f} Y{motor_y:.3f}\n"
+        ser.write(cmd.encode())
+        return True
+    return False
+
 def main():
+    global prev_error_x, prev_error_depth
+
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print("❌ Camera not found")
-        return
+    if not cap.isOpened(): return
+
+    cap.set(3, 640)
+    cap.set(4, 480)
 
     ret, frame = cap.read()
     if not ret: return
 
     print("\n--- INSTRUCTIONS ---")
-    print("1. Click and drag a box around the object (Top-Left to Bottom-Right).")
-    print("2. Press ENTER or SPACE to start tracking.")
+    print("1. Select Object.")
+    print("2. The INITIAL SIZE will be maintained.")
+    print("3. Press 'r' anytime to reset target distance.")
     
-    # FIX: fromCenter must be False for standard dragging
-    roi = cv2.selectROI("Tracker Setup", frame, showCrosshair=True, fromCenter=False)
-    cv2.destroyWindow("Tracker Setup")
+    roi = cv2.selectROI("Tracker", frame, showCrosshair=True, fromCenter=False)
+    cv2.destroyWindow("Tracker")
+    if roi[2] == 0: return
 
-    if roi[2] == 0 or roi[3] == 0:
-        print("❌ No selection made.")
-        return
-
-    # Initialize Tracker
     try:
         tracker = cv2.TrackerCSRT_create()
-    except AttributeError:
+    except:
         tracker = cv2.legacy.TrackerCSRT_create()
-        
     tracker.init(frame, roi)
-    print("✅ Tracking Started... Press 'q' to Quit.")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
+    # TARGET: Average of Width and Height
+    TARGET_SIZE = (roi[2] + roi[3]) / 2.0
+    TARGET_CENTER_X = frame.shape[1] // 2
+    
+    print(f"✅ LOCKED. Target Size: {TARGET_SIZE:.1f}px")
 
-        # Update Tracker
-        success, bbox = tracker.update(frame)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
 
-        if success:
-            x, y, w, h = [int(v) for v in bbox]
-            
-            # Calculate Centers
-            obj_cx = x + w // 2
-            obj_cy = y + h // 2
-            
-            h_frame, w_frame = frame.shape[:2]
-            frame_cx = w_frame // 2
-            frame_cy = h_frame // 2
-            
-            error_x = obj_cx - frame_cx
-            error_y = obj_cy - frame_cy
+            ok, bbox = tracker.update(frame)
+            status = "Idle"
 
-            # --- MOTION CONTROL ---
-            # We move ONE axis at a time to prevent math conflict in G91
-            
-            # X-AXIS CORRECTION
-            if abs(error_x) > DEAD_ZONE:
-                dist = abs(error_x) * PIXEL_TO_MM
-                if error_x > 0:
-                    move_machine("RIGHT", dist)
+            if ok:
+                (x, y, w, h) = [int(v) for v in bbox]
+                cx = x + w // 2
+                current_size = (w + h) / 2.0
+                
+                # --- SMOOTHING ---
+                history_x.append(cx)
+                history_size.append(current_size)
+                
+                avg_x = sum(history_x) / len(history_x)
+                avg_sz = sum(history_size) / len(history_size)
+
+                # --- 1. ERROR CALCULATION ---
+                curr_err_x = TARGET_CENTER_X - avg_x  
+                
+                # Size Error: 
+                # Target (100) - Current (80) = +20 (Object too small/far) -> Move Closer (+Front)
+                # Target (100) - Current (120) = -20 (Object too big/close) -> Move Back (-Front)
+                curr_err_depth = TARGET_SIZE - avg_sz
+
+                move_right_req = 0.0
+                move_front_req = 0.0
+
+                # --- 2. PD CONTROL ---
+                
+                # X-AXIS
+                if abs(curr_err_x) > DEAD_ZONE_X:
+                    deriv_x = curr_err_x - prev_error_x
+                    output_x = (curr_err_x * KP_X) + (deriv_x * KD_X)
+                    move_right_req = -1 * output_x * 0.1
+                    if INVERT_X: move_right_req *= -1
                 else:
-                    move_machine("LEFT", dist)
+                    prev_error_x = curr_err_x 
+
+                # DEPTH-AXIS (SENSITIVE)
+                if abs(curr_err_depth) > DEAD_ZONE_DEPTH:
+                    deriv_depth = curr_err_depth - prev_error_depth
+                    # We boost the output because pixels change slowly for depth
+                    output_depth = (curr_err_depth * KP_DEPTH) + (deriv_depth * KD_DEPTH)
                     
-            # Y-AXIS CORRECTION
-            elif abs(error_y) > DEAD_ZONE:
-                dist = abs(error_y) * PIXEL_TO_MM
-                if error_y > 0:
-                    # Object is "lower" in pixel coordinates (positive Y), 
-                    # so camera must move DOWN to catch it.
-                    move_machine("DOWN", dist)
+                    move_front_req = output_depth * 0.1
+                    if INVERT_Y: move_front_req *= -1
                 else:
-                    move_machine("UP", dist)
+                    prev_error_depth = curr_err_depth
 
-            # Draw UI
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.line(frame, (frame_cx, frame_cy), (obj_cx, obj_cy), (0, 255, 255), 2)
-            cv2.putText(frame, f"Err X:{error_x} Y:{error_y}", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        else:
-            cv2.putText(frame, "LOST TRACKING", (10, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                prev_error_x = curr_err_x
+                prev_error_depth = curr_err_depth
 
-        # Show Crosshair
-        h_frame, w_frame = frame.shape[:2]
-        cv2.circle(frame, (w_frame // 2, h_frame // 2), 5, (255, 0, 0), -1)
-        
-        cv2.imshow("CNC Tracker", frame)
-        
-        # Small delay to prevent flooding the serial buffer
-        if success:
-            time.sleep(MOVE_DELAY)
+                # --- 3. MOVE ---
+                did_move = send_simultaneous_move(move_right_req, move_front_req)
+                
+                if did_move:
+                    status = f"X:{move_right_req:.3f} Y:{move_front_req:.3f}"
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+                # --- VISUALIZATION ---
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                # Draw Size Data (Critical for Debugging)
+                label = f"Size: {avg_sz:.1f} / Tgt: {TARGET_SIZE:.1f}"
+                color = (0, 255, 0) if abs(curr_err_depth) < DEAD_ZONE_DEPTH else (0, 0, 255)
+                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-    cap.release()
-    cv2.destroyAllWindows()
-    if ser: ser.close()
+            else:
+                cv2.putText(frame, "LOST TRACKING", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+                
+            cv2.putText(frame, f"Pos: {cur_machine_x:.2f}, {cur_machine_y:.2f}", 
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, status, (10, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            cv2.imshow("Sensitive Depth Tracker", frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'): break
+            elif key == ord('r'): # Reset Target
+                TARGET_SIZE = (w + h) / 2.0
+                print(f"🔄 Target Reset to {TARGET_SIZE}")
+
+    finally:
+        print("\n🛑 Homing...")
+        cap.release()
+        cv2.destroyAllWindows()
+        if ser:
+            ser.write(b"G90 G0 X0 Y0\n")
+            time.sleep(3)
+            ser.close()
 
 if __name__ == "__main__":
     main()
