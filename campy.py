@@ -19,7 +19,7 @@ PIXEL_TO_CM_RATIO_Y = 0.05  # !! TUNE THIS LATER
 
 def main():
     # 1. Initialize Camera
-    cap = cv2.VideoCapture(1) # 0 is default webcam. Try 1 for USB cam.
+    cap = cv2.VideoCapture(0) # 0 is default webcam. Try 1 for USB cam.
     if not cap.isOpened():
         print("Error: Cannot open camera.")
         return
