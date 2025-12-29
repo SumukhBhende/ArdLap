@@ -174,7 +174,22 @@ class SerialHandler:
             self.is_connected = False
             return False
     
-    
+    def send_jog(self, jog_cmd: str):
+        """
+        Send jog command WITHOUT rate limiting
+        """
+        if not self.is_connected or not self.serial_port:
+            return False
+
+        try:
+            self.serial_port.write((jog_cmd + '\n').encode())
+            return True
+        except Exception as e:
+            logging.error(f"Jog send error: {e}")
+            self.is_connected = False
+            return False
+
+
     def jog_cancel(self):
         if self.is_connected and self.serial_port:
             self.serial_port.write(b'\x85')  # GRBL Jog Cancel
@@ -500,7 +515,6 @@ class ObjectTracker:
                         cv2.destroyWindow("Select Target (press number key)")
                         return True
                 elif key == ord('q'):
-                    self.serial.jog_cancel()
                     break
             
         except Exception as e:
@@ -602,10 +616,9 @@ class ObjectTracker:
         if best_detection is None:
             self.frames_without_detection += 1
             self.tracking_quality = 0.0
-            self.serial.jog_cancel()
             
             if self.frames_without_detection > self.config.NO_DETECTION_TIMEOUT:
-                return "LOST - NO DETECTION", (0.0, 0.0), None
+                return "STOP - NO DETECTION", (0.0, 0.0), None
             else:
                 return f"SEARCHING ({self.frames_without_detection}/{self.config.NO_DETECTION_TIMEOUT})", (0.0, 0.0), None
         
@@ -782,12 +795,12 @@ class TrackingSystem:
                         
                         # Send move command if significant
                         if abs(move_x) > 1e-4 or abs(move_y) > 1e-4:
+                            # ---- VELOCITY JOG CONTROL ----
                             jog_cmd = self.jog.velocity_to_jog(move_x, move_y)
-
-                            if jog_cmd:
-                                self.serial.send_command(jog_cmd)
-                            else:
+                            if status.startswith("STOP"):
                                 self.serial.jog_cancel()
+                            elif jog_cmd:
+                                self.serial.send_jog(jog_cmd)
 
                 else:
                     status_color = (0, 0, 255)

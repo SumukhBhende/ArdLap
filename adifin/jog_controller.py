@@ -17,7 +17,7 @@ class JogController:
         self.min_feed = min_feed
         self.jog_distance = jog_distance
         self.accel_limit = accel_limit
-
+        self.is_jogging = False
         self.last_feed = 0
         self.last_time = time.time()
 
@@ -59,7 +59,7 @@ class JogController:
         feed = speed * 1000  # SCALE FACTOR (tune if needed)
         feed = max(self.min_feed, min(feed, self.max_feed))
         feed = self._limit_accel(feed)
-
+        self.is_jogging = True
         return f"$J=G91 X{x} Y{y} F{int(feed)}"
 
 
