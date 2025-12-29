@@ -6,206 +6,232 @@ import collections
 # ===================== CONFIGURATION =====================
 
 # --- HARDWARE ---
-CAMERA_INDEX = 1         
-SERIAL_PORT = "COM3"     
+CAMERA_INDEX = 1
+SERIAL_PORT = "COM3"
 BAUDRATE = 115200
 
-# --- SAFETY LIMITS ---
-MAX_TRAVEL_LIMIT = 2.9   # Machine stays within +/- 2.9 units
+# --- WORKSPACE ---
+WORKSPACE_SIZE = 6.0            # mm
+HALF_RANGE = WORKSPACE_SIZE / 2
 
-# --- TUNING (ADJUSTED FOR STABILITY) ---
+# --- JOG CONTROL ---
+JOG_INTERVAL = 0.04             # 25 Hz
+JOG_DISTANCE = 500.0            # Placeholder distance (mm)
 
-# 1. Lateral (Left/Right)
-DEAD_ZONE_X = 30         # Increased: Ignore small shakes
-KP_X = 0.05              # Reduced: Move slower/smoother
-INVERT_X = True          # <--- CHANGED: Fixes your Left/Right issue
+# --- VELOCITY LIMITS (mm/min) ---
+MAX_VEL = 600
+MIN_VEL = 30
 
-# 2. Depth (Forward/Backward)
-DEAD_ZONE_DEPTH = 20     # Increased: Needs to be very wrong before moving
-KP_DEPTH = 0.05          # Reduced: Prevents the "Runaway" overshoot
-INVERT_Y = False         # Keep False first. If it moves WRONG way, change to True.
+# --- DEAD ZONES (pixels) ---
+DEAD_ZONE_X = 25
+DEAD_ZONE_DEPTH = 6
 
-# 3. Safety
-MAX_STEP_MM = 0.2        # <--- REDUCED: Max step is tiny now to stop crashing
-SMOOTHING_BUFFER = 10    # <--- INCREASED: Average last 10 frames for stability
+# --- VELOCITY PD GAINS ---
+KP_X, KD_X = 1.8, 1.2
+KP_D, KD_D = 3.5, 2.5
+
+INVERT_X = True
+INVERT_Y = False
+
+# --- SMOOTHING ---
+SMOOTHING = 8
 
 # =========================================================
 
-# --- STATE VARIABLES ---
-current_machine_x = 0.0
-current_machine_y = 0.0
+cur_x = 0.0
+cur_y = 0.0
+prev_err_x = 0.0
+prev_err_d = 0.0
+last_jog_time = 0
+frame_count = 0
 
-# --- SERIAL SETUP ---
-try:
-    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+hx = collections.deque(maxlen=SMOOTHING)
+hs = collections.deque(maxlen=SMOOTHING)
+
+# ===================== GRBL =====================
+
+def init_grbl():
+    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.5)
     time.sleep(2)
+
     ser.write(b"\r\n\r\n")
     time.sleep(1)
     ser.flushInput()
-    print("✅ GRBL Connected")
-    ser.write(b"G92 X0 Y0\n") # Set Home
-    ser.write(b"G21 G91\n")   # mm and Relative
-    ser.write(b"G1 F1000\n")  # Slower Feedrate for safety
 
-except Exception as e:
-    print(f"❌ Serial Error: {e}")
-    ser = None
+    print("🏠 Homing...")
+    ser.write(b"$H\n")
+    time.sleep(6)
 
-# --- SMOOTHING ---
-history_x = collections.deque(maxlen=SMOOTHING_BUFFER)
-history_width = collections.deque(maxlen=SMOOTHING_BUFFER)
+    center = WORKSPACE_SIZE / 2
+    ser.write(f"G90 G0 X{center} Y{center}\n".encode())
+    time.sleep(3)
 
-def move_machine_safely(axis, move_val):
-    global current_machine_x, current_machine_y, ser
-    if ser is None: return
+    ser.write(b"G92 X0 Y0\n")    # Define center as (0,0)
+    ser.write(b"G21\n")          # mm
+    ser.write(b"G91\n")          # incremental
+    ser.write(b"$X\n")           # unlock
 
-    # 1. Clamp Speed
-    move_val = max(min(move_val, MAX_STEP_MM), -MAX_STEP_MM)
-    
-    # 2. Check Soft Limits
-    if axis == 'X':
-        predicted_pos = current_machine_x + move_val
-        if abs(predicted_pos) > MAX_TRAVEL_LIMIT:
-            print(f"⚠️ WALL HIT X: {predicted_pos:.2f}")
-            return
-        
-        current_machine_x += move_val
-        
-        # INVERT_X HANDLER
-        # If Logic says "Move Right" (move_val > 0)
-        # We send the command that YOU verified goes Right (X+ Y+)
-        # If INVERT_X is True, we flip the sign of move_val before deciding
-        
-        effective_move = move_val
-        if INVERT_X: effective_move = -move_val
+    print("✅ Homed & Centered")
+    return ser
 
-        # CoreXY Logic:
-        # If effective > 0 (Right): X+ Y+
-        # If effective < 0 (Left):  X- Y-
-        cmd = f"X{effective_move:.3f} Y{effective_move:.3f}"
+# ===================== HELPERS =====================
 
-    elif axis == 'Y':
-        predicted_pos = current_machine_y + move_val
-        if abs(predicted_pos) > MAX_TRAVEL_LIMIT:
-            print(f"⚠️ WALL HIT Y: {predicted_pos:.2f}")
-            return
+def clamp(v):
+    if abs(v) < MIN_VEL:
+        return 0.0
+    return max(min(v, MAX_VEL), -MAX_VEL)
 
-        current_machine_y += move_val
-        
-        # INVERT_Y HANDLER
-        effective_move = move_val
-        if INVERT_Y: effective_move = -move_val
+def update_position_from_grbl(ser):
+    global cur_x, cur_y
 
-        # Y Logic (Depth):
-        # effective > 0 (Move Forward/Down): X+ Y-
-        # effective < 0 (Move Back/Up):      X- Y+
-        
-        if effective_move > 0:
-            cmd = f"X{effective_move:.3f} Y-{effective_move:.3f}"
-        else:
-            d = abs(effective_move)
-            cmd = f"X-{d:.3f} Y{d:.3f}"
+    ser.write(b"?")
+    line = ser.readline().decode(errors="ignore")
 
-    full_cmd = f"G1 {cmd}\n"
-    ser.write(full_cmd.encode())
+    if "WPos:" in line:
+        try:
+            pos = line.split("WPos:")[1].split("|")[0]
+            x, y, *_ = map(float, pos.split(","))
+            cur_x, cur_y = x, y
+        except:
+            pass
+
+def send_jog(ser, vx, vy):
+    # --- STOP ---
+    if abs(vx) < 1e-3 and abs(vy) < 1e-3:
+        ser.write(b"\x85")
+        return
+
+    dir_x = 1 if vx > 0 else -1
+    dir_y = 1 if vy > 0 else -1
+
+    # --- SOFTWARE FALLBACK LIMITS ---
+    if (cur_x >= HALF_RANGE and dir_x > 0) or (cur_x <= -HALF_RANGE and dir_x < 0):
+        vx = 0
+    if (cur_y >= HALF_RANGE and dir_y > 0) or (cur_y <= -HALF_RANGE and dir_y < 0):
+        vy = 0
+
+    feed = max(abs(vx), abs(vy))
+
+    if feed < MIN_VEL:
+        ser.write(b"\x85")
+        return
+
+    cmd = (
+        f"$J=G91 "
+        f"X{JOG_DISTANCE * (vx / feed):.3f} "
+        f"Y{JOG_DISTANCE * (vy / feed):.3f} "
+        f"F{feed:.1f}\n"
+    )
+    ser.write(cmd.encode())
+
+# ===================== MAIN =====================
 
 def main():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened(): return
+    global prev_err_x, prev_err_d, last_jog_time, frame_count
 
-    # Standard res
+    ser = init_grbl()
+
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(3, 640)
     cap.set(4, 480)
 
     ret, frame = cap.read()
-    if not ret: return
+    if not ret:
+        return
 
-    print("\n--- READY ---")
-    roi = cv2.selectROI("Select Object", frame, showCrosshair=True, fromCenter=False)
-    cv2.destroyWindow("Select Object")
-    if roi[2] == 0: return
+    roi = cv2.selectROI("Tracker", frame, False)
+    cv2.destroyWindow("Tracker")
 
-    try:
-        tracker = cv2.TrackerCSRT_create()
-    except:
-        tracker = cv2.legacy.TrackerCSRT_create()
+    tracker = cv2.TrackerCSRT_create()
     tracker.init(frame, roi)
 
-    TARGET_WIDTH = roi[2]
-    TARGET_CENTER_X = frame.shape[1] // 2
-    
-    print(f"✅ LOCKED. Target Width: {TARGET_WIDTH}")
+    TARGET_SIZE = (roi[2] + roi[3]) / 2
+    CX = frame.shape[1] // 2
+    CY = frame.shape[0] // 2
 
     try:
         while True:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                break
+
+            frame_count += 1
+
+            if frame_count % 8 == 0:
+                update_position_from_grbl(ser)
 
             ok, bbox = tracker.update(frame)
-            status_text = "Idle"
+            vx = vy = 0.0
+
+            # --- VISUAL WORKSPACE OVERLAY ---
+            margin_x = int(frame.shape[1] * 0.15)
+            margin_y = int(frame.shape[0] * 0.15)
+            cv2.rectangle(
+                frame,
+                (margin_x, margin_y),
+                (frame.shape[1] - margin_x, frame.shape[0] - margin_y),
+                (255, 0, 0), 2
+            )
 
             if ok:
-                (x, y, w, h) = [int(v) for v in bbox]
+                x, y, w, h = map(int, bbox)
                 cx = x + w // 2
-                
-                history_x.append(cx)
-                history_width.append(w)
-                avg_x = sum(history_x) / len(history_x)
-                avg_w = sum(history_width) / len(history_width)
+                size = (w + h) / 2
 
-                # --- ERROR CALCULATION ---
-                # X Error: Target(320) - Current(200) = +120. Machine must move LEFT to catch up.
-                # (My previous code did Current - Target, so signs were flipped. 
-                # I fixed it here to be standard: Error = Setpoint - ProcessVar)
-                
-                # Logic: We want the CAMERA to follow the object.
-                # If Object is at 100 (Left), Camera is at 320.
-                # Camera needs to move LEFT.
-                # Error = 100 - 320 = -220. 
-                # Negative Error -> Move Negative (Left).
-                # My 'move_machine' function maps Neg -> Left.
-                # So: Error = Current - Center.
-                
-                err_x = avg_x - TARGET_CENTER_X
-                err_depth = TARGET_WIDTH - avg_w 
+                hx.append(cx)
+                hs.append(size)
 
-                # CONTROL X
+                avg_x = sum(hx) / len(hx)
+                avg_s = sum(hs) / len(hs)
+
+                err_x = CX - avg_x
+                err_d = TARGET_SIZE - avg_s
+
                 if abs(err_x) > DEAD_ZONE_X:
-                    # err_x is pixels (e.g. 50). KP is 0.05. Move = 2.5 units? Too big.
-                    # scaled by 0.1 again inside just to be sure.
-                    move_req = err_x * KP_X * 0.1 
-                    move_machine_safely('X', move_req)
-                    status_text = f"X Correction"
+                    vx = KP_X * err_x + KD_X * (err_x - prev_err_x)
+                    if INVERT_X:
+                        vx *= -1
 
-                # CONTROL Y (Depth)
-                elif abs(err_depth) > DEAD_ZONE_DEPTH:
-                    # If err_depth is Positive (Target > Current), Object is Small (Far).
-                    # We need to move Forward (+).
-                    move_req = err_depth * KP_DEPTH * 0.1
-                    move_machine_safely('Y', move_req)
-                    
-                    if move_req > 0: status_text = "Approaching..."
-                    else: status_text = "Backing up..."
+                if abs(err_d) > DEAD_ZONE_DEPTH:
+                    vy = KP_D * err_d + KD_D * (err_d - prev_err_d)
+                    if INVERT_Y:
+                        vy *= -1
 
-                # Visuals
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                
-            cv2.putText(frame, f"Machine: ({current_machine_x:.2f}, {current_machine_y:.2f})", 
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.putText(frame, status_text, (10, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            
-            cv2.imshow("Tracker", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
+                prev_err_x = err_x
+                prev_err_d = err_d
+
+                vx = clamp(vx)
+                vy = clamp(vy)
+
+                now = time.time()
+                if now - last_jog_time > JOG_INTERVAL:
+                    send_jog(ser, vx, vy)
+                    last_jog_time = now
+
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0,255,0), 2)
+
+            else:
+                ser.write(b"\x85")
+
+            cv2.putText(
+                frame,
+                f"POS X:{cur_x:.2f} Y:{cur_y:.2f}  VX:{vx:.0f} VY:{vy:.0f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0,255,255),
+                2
+            )
+
+            cv2.imshow("Velocity-Based Visual Servo (GRBL)", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
     finally:
-        print("\n🛑 Returning Home...")
+        ser.write(b"\x85")
         cap.release()
         cv2.destroyAllWindows()
-        if ser:
-            ser.write(b"G90\n")
-            ser.write(b"G0 X0 Y0\n")
-            time.sleep(3)
-            ser.close()
+        ser.close()
 
 if __name__ == "__main__":
     main()
