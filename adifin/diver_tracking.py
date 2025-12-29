@@ -22,8 +22,8 @@ import collections
 import numpy as np
 from typing import Optional, Tuple, List
 from dataclasses import dataclass, field
-from adifin.gcode_translator import GCodeTranslator
-from adifin.jog_controller import JogController
+from gcode_translator import GCodeTranslator
+from jog_controller import JogController
 
 
 # Model inference imports
@@ -56,7 +56,7 @@ logging.basicConfig(
 class Config:
     """System configuration parameters"""
     # Serial Communication
-    SERIAL_PORT: str = 'COM3' # Update as needed
+    SERIAL_PORT: str = 'COM10' # Update as needed
     BAUD_RATE: int = 115200
     SERIAL_TIMEOUT: float = 0.1
     
@@ -67,7 +67,7 @@ class Config:
     CAM_FPS: int = 30
     
     # Model Configuration
-    MODEL_PATH: str = './adifin/best.pt'  
+    MODEL_PATH: str = './MajorProject/best.pt'  
     MODEL_CONFIDENCE: float = 0.5              # Detection confidence threshold
     MODEL_IOU: float = 0.45                    # NMS IOU threshold
     TARGET_CLASS: Optional[int] = None         # None = any class, or specific class ID
@@ -134,8 +134,7 @@ class SerialHandler:
                     time.sleep(1)
                     self.serial_port.flushInput()
                     self.serial_port.write(b"G92 X0 Y0\n")
-                    self.serial_port.write(b"G21 G91\n")
-                    self.serial_port.write(b"G1 F800\n")  # Reduced speed for stability
+                    self.serial_port.write(b"G21\n")  # mm units only
                     
                     logging.info(f"Serial connection established on {self.config.SERIAL_PORT}")
                     return True
@@ -794,14 +793,18 @@ class TrackingSystem:
                         cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
                         
                         # Send move command if significant
-                        if abs(move_x) > 1e-4 or abs(move_y) > 1e-4:
-                            # ---- VELOCITY JOG CONTROL ----
-                            jog_cmd = self.jog.velocity_to_jog(move_x, move_y)
-                            if status.startswith("STOP"):
-                                self.serial.jog_cancel()
-                            elif jog_cmd:
-                                self.serial.send_jog(jog_cmd)
+                        # ---- VELOCITY JOG CONTROL (CORRECT & SAFE) ----
+                        jog_cmd = self.jog.velocity_to_jog(move_x, move_y)
 
+                        if status.startswith("STOP"):
+                            self.serial.jog_cancel()
+
+                        elif jog_cmd:
+                            self.serial.send_jog(jog_cmd)
+
+                        else:
+                            # velocity ≈ 0 → stop motion
+                            self.serial.jog_cancel()
                 else:
                     status_color = (0, 0, 255)
                 

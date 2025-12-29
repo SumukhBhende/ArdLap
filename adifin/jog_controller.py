@@ -63,7 +63,3 @@ class JogController:
         return f"$J=G91 X{x} Y{y} F{int(feed)}"
 
 
-'''
-now we need to convert this into ROS nodes, such that we can feed it to blue ROV2 and trigger it's actuators
-we will simulate it in gazeebo first and check, but for that give ROS node code for this
-'''
