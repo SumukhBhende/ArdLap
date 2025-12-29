@@ -37,7 +37,7 @@ class Config:
     SERIAL_TIMEOUT: float = 0.01  # Reduced to prevent lag
     
     # Camera Settings
-    CAM_INDEX: int = 0
+    CAM_INDEX: int = 1
     CAM_WIDTH: int = 640
     CAM_HEIGHT: int = 480
     CAM_FPS: int = 30
