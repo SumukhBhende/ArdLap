@@ -56,7 +56,7 @@ logging.basicConfig(
 class Config:
     """System configuration parameters"""
     # Serial Communication
-    SERIAL_PORT: str = 'COM10' 
+    SERIAL_PORT: str = 'COM3' # Update as needed
     BAUD_RATE: int = 115200
     SERIAL_TIMEOUT: float = 0.1
     
@@ -67,7 +67,7 @@ class Config:
     CAM_FPS: int = 30
     
     # Model Configuration
-    MODEL_PATH: str = './MajorProject/best.pt'  
+    MODEL_PATH: str = './adifin/best.pt'  
     MODEL_CONFIDENCE: float = 0.5              # Detection confidence threshold
     MODEL_IOU: float = 0.45                    # NMS IOU threshold
     TARGET_CLASS: Optional[int] = None         # None = any class, or specific class ID
