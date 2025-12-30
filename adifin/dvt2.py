@@ -8,62 +8,53 @@ SERIAL_PORT = 'COM3'
 BAUD_RATE = 115200
 CAM_INDEX = 1
 
-
-
 # INVERSION SETTINGS
 INVERT_X = False 
 INVERT_Y = True  
 
-JOG_SPEED = 10  
-JOG_DIST = 300  
+JOG_SPEED = 100  # You can change this (e.g., 10, 30, 70)
+JOG_DIST = 500  
 
+# PHYSICAL LIMITS (Measured at your slowest speed, e.g., F10)
+PHYSICAL_W = 1.70 #1.90 
+PHYSICAL_S = -2.60 #-2.80
+PHYSICAL_A = 1.80  #1.80
+PHYSICAL_D = -1.80 #-1.90 
 
-# YOUR MEASURED LIMITS JogSpeed 70 for BOUNDARIES
-OLIMIT_W = 4.11  # Max +Y
-OLIMIT_S = -3.76 # Max -Y
-OLIMIT_A = 4.22  # Max +X
-OLIMIT_D = -4.48 # Max -X
-
-# YOUR CALIBRATED LIMITS at JogSpeed 10 for BOUNDARIES
-LIMIT_W = (OLIMIT_W/10)*JOG_SPEED  # Max +Y
-LIMIT_S = (OLIMIT_S/10)*JOG_SPEED  # Max -Y
-LIMIT_A = (OLIMIT_A/10)*JOG_SPEED  # Max +X
-LIMIT_D = (OLIMIT_D/10)*JOG_SPEED  # Max -X
+# LATENCY COMPENSATION
+# This compensates for the "skid" at higher speeds.
+# 0.06 means the script stops 0.06 seconds 'early' to account for lag.
+BRAKE_FACTOR = 0.06 
 
 class SafeController:
     def __init__(self):
         try:
-            self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.05)
+            self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
             time.sleep(2) 
             self.ser.write(b"\r\n\r\n") 
             time.sleep(1)
             self.ser.write(b"$X\n") # Unlock
             self.ser.write(b"G92 X0 Y0\n") # Zero center
-            print("GRBL 1.1h Safe Mode Active. W-A-S-D to move, X to stop.")
+            print(f"Safe Mode Active. Jog Speed: {JOG_SPEED}")
         except Exception as e:
             print(f"Connection Error: {e}")
             exit()
 
     def get_real_pos(self):
-        """Polls GRBL for actual Machine Position (MPos)"""
         self.ser.write(b"?")
         status = self.ser.readline().decode('utf-8', errors='ignore')
-        # Regex to find MPos:X,Y,Z
         match = re.search(r'MPos:([-.\d]+),([-.\d]+),([-.\d]+)', status)
         if match:
-            # CoreXY Transformation back to Cartesian for boundary check
-            # cartesian_x = (motor_a + motor_b) / 2
-            # cartesian_y = (motor_b - motor_a) / 2
             ma, mb = float(match.group(1)), float(match.group(2))
             return (ma + mb) / 2, (mb - ma) / 2
         return None
 
-    def stop_and_home(self):
-        """Stops all motion immediately and returns home"""
-        self.ser.write(b'\x85') # Real-time Jog Cancel
+    def stop_and_home(self, manual=False):
+        self.ser.write(b'\x85') # Jog Cancel
         time.sleep(0.1)
-        self.ser.write(b"G90 G21 X0 Y0 F800\n") # Absolute return
-        print("Safety Triggered: Returning to Center.")
+        self.ser.write(b"G90 G21 X0 Y0 F800\n") 
+        if not manual:
+            print("Boundary Safety Triggered.")
 
     def run(self):
         cap = cv2.VideoCapture(CAM_INDEX)
@@ -73,27 +64,35 @@ class SafeController:
             ret, frame = cap.read()
             if not ret: break
 
-            # 1. POLL REAL POSITION
             pos = self.get_real_pos()
             if pos:
                 curr_x, curr_y = pos
                 
-                # 2. BOUNDARY CHECK (Hard Stop)
-                if (curr_y >= LIMIT_W or curr_y <= LIMIT_S or 
-                    curr_x >= LIMIT_A or curr_x <= LIMIT_D):
+                # --- DYNAMIC LIMIT CALCULATION ---
+                # This subtracts a 'safety buffer' that grows with speed.
+                # Speed (mm/min) / 60 = mm per second.
+                skid_margin = (JOG_SPEED / 60.0) * BRAKE_FACTOR
+                
+                limit_w = PHYSICAL_W - skid_margin
+                limit_s = PHYSICAL_S + skid_margin
+                limit_a = PHYSICAL_A - skid_margin
+                limit_d = PHYSICAL_D + skid_margin
+
+                # Check against Dynamic Limits
+                if (curr_y >= limit_w or curr_y <= limit_s or 
+                    curr_x >= limit_a or curr_x <= limit_d):
                     if current_moving:
-                        print("current x: ", curr_x, " current y: ", curr_y)
+                        print(f"Braking! Margin: {skid_margin:.3f}mm | Pos: X{curr_x:.2f} Y{curr_y:.2f}")
                         self.stop_and_home()
                         current_moving = False
 
-                # HUD
-                cv2.putText(frame, f"ACTUAL POS: X{curr_x:.2f} Y{curr_y:.2f}", (10, 30), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(frame, f"POS: X{curr_x:.2f} Y{curr_y:.2f}", (10, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            cv2.imshow("Safe Feedback Control", frame)
+            cv2.imshow("Feedback Control", frame)
             key = cv2.waitKey(1) & 0xFF
 
-            # 3. HANDLE INPUTS
+            # Movement Logic
             if key in [ord('w'), ord('s'), ord('a'), ord('d')] and not current_moving:
                 dx, dy = 0, 0
                 if key == ord('w'): dy = JOG_DIST
@@ -104,11 +103,15 @@ class SafeController:
                 if INVERT_X: dx *= -1
                 if INVERT_Y: dy *= -1
 
-                # CoreXY: MotorA = X - Y | MotorB = X + Y
                 ma, mb = dx - dy, dx + dy
                 self.ser.write(f"$J=G91 G21 X{ma:.3f} Y{mb:.3f} F{JOG_SPEED}\n".encode())
                 current_moving = True
-
+            
+            # --- YOUR CRITICAL KEYBOARD LOGIC ---
+            elif key == ord('c'):
+                self.stop_and_home(manual=True)
+                current_moving = False
+            
             elif key == ord('x') or key == ord('q'):
                 self.ser.write(b'\x85')
                 current_moving = False
