@@ -9,7 +9,7 @@ from ultralytics import YOLO
 SERIAL_PORT = 'COM3'
 BAUD_RATE = 115200
 CAM_INDEX = 1
-MODEL_PATH = 'best.pt'
+MODEL_PATH = './adifin/best.pt'
 
 # INVERSION SETTINGS
 INVERT_X = False 
