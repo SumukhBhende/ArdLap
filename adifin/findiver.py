@@ -23,10 +23,10 @@ KP_X, KD_X = 0.16, 0.06
 KP_Y, KD_Y = 0.12, 0.04   
 
 # ROBUSTNESS SETTINGS
-DEADBAND_X = 6 #12           
+DEADBAND_X = 8 #12           
 DEADBAND_Y = 1.0 #2.0          
 DETECTION_TIMEOUT = 6     
-SMOOTHING_WINDOW = 3 #3 , integer only     
+SMOOTHING_WINDOW = 2 #3 , integer only     
 STARTUP_SETTLE_FRAMES = 5 
 
 # PHYSICAL LIMITS
